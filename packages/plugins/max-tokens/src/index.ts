@@ -1,19 +1,41 @@
 import { Plugin } from '@envelop/types';
 import type { GraphQLArmorCallbackConfiguration } from '@escape.tech/graphql-armor-types';
 import { GraphQLError, Source, TokenKind } from 'graphql';
-import { syntaxError } from 'graphql/error';
 import { ParseOptions, Parser } from 'graphql/language/parser';
 
-type maxTokensParserWLexerOptions = ParseOptions & {
-  n: number;
-} & GraphQLArmorCallbackConfiguration;
+type maxTokensParserWLexerOptions = ParseOptions & Required<MaxTokensOptions>;
 
-export type MaxTokensOptions = { n?: number } & GraphQLArmorCallbackConfiguration;
+export type MaxTokensOptions = { n?: number; finishParsing?: boolean } & GraphQLArmorCallbackConfiguration;
 export const maxTokenDefaultOptions: Required<MaxTokensOptions> = {
   n: 1000,
   onAccept: [],
   onReject: [],
   propagateOnRejection: true,
+  finishParsing: false,
+};
+
+const createTokenLimitError = (config: Required<MaxTokensOptions>, tokenCount: number) => {
+  if (config.finishParsing) {
+    return new GraphQLError(`Syntax Error: Token limit of ${config.n} exceeded, found ${tokenCount}`);
+  }
+
+  return new GraphQLError(`Syntax Error: Token limit of ${config.n} exceeded.`);
+};
+
+const processParsingResult = (config: Required<MaxTokensOptions>, tokenCount: number) => {
+  if (tokenCount > config.n) {
+    const err = createTokenLimitError(config, tokenCount);
+    for (const handler of config.onReject) {
+      handler(null, err);
+    }
+    if (config.propagateOnRejection) {
+      throw err;
+    }
+  }
+
+  for (const handler of config.onAccept) {
+    handler(null, { n: tokenCount });
+  }
 };
 
 export class MaxTokensParserWLexer extends Parser {
@@ -24,14 +46,10 @@ export class MaxTokensParserWLexer extends Parser {
     return this._tokenCount;
   }
 
-  constructor(source: string | Source, options?: maxTokensParserWLexerOptions) {
+  constructor(source: string | Source, options: maxTokensParserWLexerOptions) {
     super(source, options);
 
-    this.config = Object.assign(
-      {},
-      maxTokenDefaultOptions,
-      ...Object.entries(options ?? {}).map(([k, v]) => (v === undefined ? {} : { [k]: v })),
-    );
+    this.config = options;
 
     const lexer = this._lexer;
     this._lexer = new Proxy(lexer, {
@@ -43,20 +61,8 @@ export class MaxTokensParserWLexer extends Parser {
               this._tokenCount++;
             }
 
-            if (this._tokenCount > this.config.n) {
-              const err = new GraphQLError(`Syntax Error: Token limit of ${this.config.n} exceeded.`);
-
-              for (const handler of this.config.onReject) {
-                handler(null, err);
-              }
-
-              if (this.config.propagateOnRejection) {
-                throw err;
-              }
-            }
-
-            for (const handler of this.config.onAccept) {
-              handler(null, { n: this._tokenCount });
+            if (!this.config.finishParsing) {
+              processParsingResult(this.config, this._tokenCount);
             }
             return token;
           };
@@ -69,9 +75,14 @@ export class MaxTokensParserWLexer extends Parser {
 
 export function maxTokensPlugin(config?: MaxTokensOptions): Plugin {
   function parseWithTokenLimit(source: string | Source, options?: ParseOptions) {
-    // @ts-expect-error TODO(@c3b5aw): address the type issue
-    const parser = new MaxTokensParserWLexer(source, Object.assign({}, options, config));
-    return parser.parseDocument();
+    const maxTokenOptions = Object.assign({}, maxTokenDefaultOptions, config);
+
+    const parser = new MaxTokensParserWLexer(source, Object.assign({}, options, maxTokenOptions));
+    const document = parser.parseDocument();
+    if (maxTokenOptions.finishParsing) {
+      processParsingResult(maxTokenOptions, parser.tokenCount);
+    }
+    return document;
   }
   return {
     onParse({ setParseFn }) {
